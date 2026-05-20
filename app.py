@@ -35,8 +35,6 @@ TARGET_MEDIA = {
 
 # =============================
 # 주제별 관련성 규칙
-# required: 반드시 제목/요약에 들어가야 하는 핵심어
-# optional: 있으면 관련성 점수를 높이는 보조어
 # =============================
 
 TOPIC_RULES = {
@@ -93,12 +91,19 @@ TOPIC_RULES = {
 GENERIC_WORDS = {
     "정책", "대책", "문제", "이슈", "뉴스", "관련", "현안",
     "논란", "분석", "전망", "정부", "국회", "사회", "경제",
-    "오늘", "주요", "최근", "개편", "방안"
+    "오늘", "주요", "최근", "개편", "방안", "추진"
 }
+
+AI_MODEL_OPTIONS = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash"
+]
 
 
 # =============================
-# 유틸
+# 유틸 함수
 # =============================
 
 def clean_text(text):
@@ -116,6 +121,10 @@ def get_secret(name):
         pass
 
     return os.getenv(name, "")
+
+
+def unique_list(values):
+    return list(dict.fromkeys([v for v in values if v]))
 
 
 def get_topic_rule(base_query):
@@ -138,10 +147,7 @@ def get_topic_rule(base_query):
     else:
         required = query_words
 
-    required = list(dict.fromkeys(required))
-    optional = list(dict.fromkeys(optional))
-
-    return required, optional
+    return unique_list(required), unique_list(optional)
 
 
 def score_article(row, required_keywords, optional_keywords):
@@ -151,7 +157,6 @@ def score_article(row, required_keywords, optional_keywords):
 
     score = 0
     matched = []
-
     required_hit = False
 
     for keyword in required_keywords:
@@ -172,9 +177,7 @@ def score_article(row, required_keywords, optional_keywords):
             score += 0.5
             matched.append(keyword)
 
-    matched = list(dict.fromkeys(matched))
-
-    return required_hit, score, ", ".join(matched)
+    return required_hit, score, ", ".join(unique_list(matched))
 
 
 def filter_relevant_news(raw_df, base_query):
@@ -186,6 +189,7 @@ def filter_relevant_news(raw_df, base_query):
     df = raw_df.copy()
 
     if not required_keywords:
+        df["required_hit"] = True
         df["relevance_score"] = 0
         df["matched_keywords"] = ""
         return df
@@ -199,7 +203,6 @@ def filter_relevant_news(raw_df, base_query):
     df["relevance_score"] = [r[1] for r in results]
     df["matched_keywords"] = [r[2] for r in results]
 
-    # 핵심어가 제목/요약에 실제로 들어간 기사만 남김
     filtered_df = df[
         (df["required_hit"] == True) &
         (df["relevance_score"] >= 2)
@@ -211,6 +214,12 @@ def filter_relevant_news(raw_df, base_query):
     )
 
     return filtered_df
+
+
+def build_search_query(base_query, media, strict_phrase=False):
+    if strict_phrase:
+        return f'"{base_query}" {media}'
+    return f"{base_query} {media}"
 
 
 # =============================
@@ -270,15 +279,14 @@ def search_naver_news(query, display=10, sort="sim"):
     return pd.DataFrame(rows)
 
 
-def collect_news_by_media_group(base_query, display_per_media=3, sort="sim"):
+def collect_news_by_media_group(base_query, display_per_media=3, sort="sim", strict_phrase=False):
     all_rows = []
 
-    # 최종 표시 수보다 많이 가져온 뒤, 관련성 필터로 걸러냄
     fetch_per_media = max(10, display_per_media * 5)
 
     for group, media_list in TARGET_MEDIA.items():
         for media in media_list:
-            search_query = f"{base_query} {media}"
+            search_query = build_search_query(base_query, media, strict_phrase=strict_phrase)
 
             temp_df = search_naver_news(
                 query=search_query,
@@ -306,7 +314,10 @@ def collect_news_by_media_group(base_query, display_per_media=3, sort="sim"):
     if not filtered_df.empty:
         filtered_df = (
             filtered_df
-            .sort_values(by=["group", "target_media", "relevance_score"], ascending=[True, True, False])
+            .sort_values(
+                by=["group", "target_media", "relevance_score"],
+                ascending=[True, True, False]
+            )
             .groupby(["group", "target_media"], as_index=False, group_keys=False)
             .head(display_per_media)
         )
@@ -315,10 +326,86 @@ def collect_news_by_media_group(base_query, display_per_media=3, sort="sim"):
 
 
 # =============================
-# Gemini 요약
+# AI 입력 및 대체 브리핑
 # =============================
 
-def summarize_with_gemini(df, base_query):
+def build_ai_input(df, max_per_group=4):
+    compact_news_text = ""
+
+    for group in ["progressive", "conservative", "center"]:
+        group_df = df[df["group"] == group].head(max_per_group)
+        compact_news_text += f"\n[{group}]\n"
+
+        if group_df.empty:
+            compact_news_text += "관련 기사 없음\n"
+            continue
+
+        for _, row in group_df.iterrows():
+            media = str(row.get("target_media", ""))[:20]
+            title = str(row.get("title", ""))[:90]
+            description = str(row.get("description", ""))[:120]
+            matched_keywords = str(row.get("matched_keywords", ""))[:80]
+
+            compact_news_text += (
+                f"- {media} | 키워드: {matched_keywords} | "
+                f"제목: {title} | 요약: {description}\n"
+            )
+
+    return compact_news_text
+
+
+def make_fallback_briefing(df, base_query, error=None):
+    text = f"""
+## 간이 프레임 브리핑
+
+AI 요약 생성이 불안정하여, 수집된 기사 제목과 키워드를 기준으로 간이 브리핑을 표시합니다.
+
+### 검색 주제
+- {base_query}
+
+### 그룹별 수집 현황
+"""
+
+    for group in ["progressive", "conservative", "center"]:
+        group_df = df[df["group"] == group]
+        text += f"\n#### {group}\n"
+
+        if group_df.empty:
+            text += "- 관련 기사 없음\n"
+            continue
+
+        keywords = []
+        for value in group_df["matched_keywords"].dropna().tolist():
+            for keyword in str(value).split(","):
+                keyword = keyword.strip()
+                if keyword:
+                    keywords.append(keyword)
+
+        top_keywords = unique_list(keywords)[:8]
+
+        if top_keywords:
+            text += "- 주요 관련 키워드: " + ", ".join(top_keywords) + "\n"
+
+        for _, row in group_df.head(3).iterrows():
+            media = row.get("target_media", "")
+            title = row.get("title", "")
+            text += f"- {media}: {title}\n"
+
+    text += """
+
+### 해석상 주의
+- 이 내용은 AI가 생성한 정밀한 프레임 분석이 아니라, 수집된 기사 제목·요약·키워드 기반의 간이 정리입니다.
+- 특정 그룹의 기사 수가 적으면 프레임 차이를 단정하기 어렵습니다.
+- 더 정확한 비교를 위해서는 검색어를 구체화하는 것이 좋습니다.
+"""
+
+    if error is not None:
+        text += f"\n오류 유형: `{type(error).__name__}`\n"
+
+    return text
+
+
+def generate_ai_briefing(df, base_query, preferred_model):
     gemini_api_key = get_secret("GEMINI_API_KEY")
 
     if not gemini_api_key:
@@ -327,120 +414,87 @@ def summarize_with_gemini(df, base_query):
 
 Gemini API 키가 설정되지 않았습니다.  
 Streamlit Secrets에서 `GEMINI_API_KEY` 값을 확인하세요.
-"""
+""", None, None
 
     client = genai.Client(api_key=gemini_api_key)
 
-    grouped_news_text = ""
-
-    for group in ["progressive", "conservative", "center"]:
-        group_df = df[df["group"] == group].head(5)
-        grouped_news_text += f"\n\n### {group} 그룹\n"
-
-        if group_df.empty:
-            grouped_news_text += "- 수집된 관련 뉴스 없음\n"
-            continue
-
-        for _, row in group_df.iterrows():
-            title = str(row.get("title", ""))[:120]
-            description = str(row.get("description", ""))[:220]
-            link = str(row.get("link", ""))
-            target_media = str(row.get("target_media", ""))
-            matched_keywords = str(row.get("matched_keywords", ""))
-
-            grouped_news_text += f"""
-- 언론사 검색 기준: {target_media}
-- 관련 키워드: {matched_keywords}
-- 제목: {title}
-- 요약: {description}
-- 링크: {link}
-"""
+    compact_news_text = build_ai_input(df, max_per_group=4)
 
     prompt = f"""
-너는 뉴스 프레임 비교 에이전트다.
+너는 뉴스 제목과 요약문만 보고 보도 경향을 비교하는 분석 도우미다.
 
 검색 주제: {base_query}
 
-아래 뉴스 목록은 사용자가 설정한 언론사 그룹별 뉴스 검색 결과다.
-기사 본문 전문이 아니라 제목과 요약문만 제공되었다.
+자료의 한계:
+- 기사 본문 전문은 제공되지 않았다.
+- 제목과 요약문만 제공되었다.
+- progressive, conservative, center는 사용자가 설정한 비교 그룹명이다.
 
 분석 원칙:
-- 제목과 요약문에 근거해서만 분석한다.
-- 기사에 없는 사실은 만들지 않는다.
-- 단정적 표현을 피한다.
-- progressive, conservative, center는 사용자가 설정한 비교 그룹명이다.
-- 정치적 판단이 아니라 보도 강조점, 표현, 프레임 차이를 비교한다.
-- 특정 그룹에 관련 기사가 부족하면 부족하다고 명시한다.
-- 서로 다른 이슈가 섞여 있으면 무리하게 하나의 결론으로 묶지 않는다.
+- 제목과 요약문에 있는 내용만 사용한다.
+- 기사에 없는 사실을 만들지 않는다.
+- 단정하지 않는다.
+- 각 그룹의 표현, 강조점, 문제 정의 방식만 비교한다.
+- 근거가 부족하면 부족하다고 쓴다.
+- 서로 다른 이슈가 섞여 있으면 억지로 하나의 결론으로 묶지 않는다.
 
-출력 형식:
+출력은 반드시 아래 형식으로만 작성한다.
 
-## 오늘의 주요 이슈
+## 핵심 이슈
+- 
 
-## 공통적으로 확인되는 내용
+## 그룹별 보도 경향
+### progressive
+- 
 
-## progressive 그룹 보도 경향
+### conservative
+- 
 
-## conservative 그룹 보도 경향
-
-## center 그룹 보도 경향
+### center
+- 
 
 ## 프레임 차이
+- 
 
-## 근거 부족 또는 주의할 점
-
-## 참고 기사 링크
+## 해석상 주의할 점
+- 
 
 뉴스 목록:
-{grouped_news_text}
+{compact_news_text}
 """
 
+    model_candidates = unique_list([preferred_model] + AI_MODEL_OPTIONS)
     last_error = None
 
-    for attempt in range(2):
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt
-            )
+    for model_name in model_candidates:
+        for attempt in range(2):
+            try:
+                try:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config={
+                            "temperature": 0.1,
+                            "max_output_tokens": 1200,
+                        }
+                    )
+                except TypeError:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=prompt
+                    )
 
-            if response.text:
-                return response.text
+                text = getattr(response, "text", None)
 
-            return """
-## AI 프레임 비교 생성 실패
+                if text and text.strip():
+                    return text, model_name, None
 
-Gemini가 빈 응답을 반환했습니다.  
-검색어를 조금 더 구체적으로 바꿔 다시 시도하세요.
-"""
+            except Exception as e:
+                last_error = e
+                time.sleep(1.5)
 
-        except Exception as e:
-            last_error = e
-            time.sleep(2)
-
-    return f"""
-## AI 프레임 비교 생성 실패
-
-뉴스 수집은 정상적으로 완료되었지만, Gemini 요약 생성 단계에서 오류가 발생했습니다.
-
-### 현재 상태
-- 네이버 뉴스 수집: 정상
-- 관련 기사 필터링: 정상
-- Gemini 요약 생성: 실패
-
-### 가능한 원인
-- Gemini API 서버의 일시적 오류
-- 특정 검색어에서 Gemini 응답이 실패함
-- Gemini API 사용량 제한 또는 일시적 장애
-
-### 바로 해볼 조치
-1. 검색어를 더 구체적으로 바꿔보세요.
-2. 잠시 후 다시 실행해보세요.
-3. 다른 주제에서도 계속 실패하면 Gemini API 키 상태를 확인하세요.
-
-### 오류 유형
-`{type(last_error).__name__}`
-"""
+    fallback = make_fallback_briefing(df, base_query, error=last_error)
+    return fallback, None, last_error
 
 
 # =============================
@@ -452,7 +506,7 @@ with st.sidebar:
 
     base_query = st.text_input(
         "분석할 주제",
-        value="돌봄"
+        value="돌봄 공백"
     )
 
     display_per_media = st.slider(
@@ -469,6 +523,17 @@ with st.sidebar:
     )
 
     sort = "sim" if sort_label == "정확도순" else "date"
+
+    strict_phrase = st.checkbox(
+        "검색어를 따옴표로 묶어 엄격 검색",
+        value=False
+    )
+
+    preferred_model = st.selectbox(
+        "AI 모델",
+        options=AI_MODEL_OPTIONS,
+        index=0
+    )
 
     run_button = st.button("뉴스 수집 및 프레임 비교")
 
@@ -489,7 +554,8 @@ if run_button:
             df, raw_df = collect_news_by_media_group(
                 base_query=base_query,
                 display_per_media=display_per_media,
-                sort=sort
+                sort=sort,
+                strict_phrase=strict_phrase
             )
 
         st.subheader("수집 및 필터링 결과")
@@ -546,9 +612,35 @@ if run_button:
 
             st.subheader("AI 프레임 비교 브리핑")
 
-            with st.spinner("Gemini가 프레임 차이를 분석하는 중입니다."):
-                summary = summarize_with_gemini(df, base_query)
-                st.markdown(summary)
+            with st.spinner("AI가 프레임 차이를 분석하는 중입니다."):
+                summary, used_model, ai_error = generate_ai_briefing(
+                    df=df,
+                    base_query=base_query,
+                    preferred_model=preferred_model
+                )
+
+            if used_model:
+                st.caption(f"사용된 AI 모델: {used_model}")
+            else:
+                st.warning("AI 모델 응답이 실패하여 간이 브리핑을 표시합니다.")
+
+            st.markdown(summary)
+
+            st.subheader("참고 기사 링크")
+
+            for group in ["progressive", "conservative", "center"]:
+                group_df = df[df["group"] == group]
+
+                if group_df.empty:
+                    continue
+
+                st.markdown(f"### {group}")
+
+                for _, row in group_df.iterrows():
+                    media = row.get("target_media", "")
+                    title = row.get("title", "")
+                    link = row.get("link", "")
+                    st.markdown(f"- **{media}**: [{title}]({link})")
 
 else:
     st.info("왼쪽에서 분석할 주제를 입력하고 버튼을 눌러주세요.")

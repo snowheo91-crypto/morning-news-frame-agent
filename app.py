@@ -1,10 +1,16 @@
-import streamlit as st
-import requests
-import pandas as pd
+import os
+import time
 import html
 import re
-import time
+import requests
+import pandas as pd
+import streamlit as st
 from google import genai
+
+
+# =============================
+# 기본 화면 설정
+# =============================
 
 st.set_page_config(
     page_title="아침 뉴스 프레임 브리핑",
@@ -15,59 +21,85 @@ st.set_page_config(
 st.title("📰 아침 뉴스 프레임 브리핑")
 st.caption("네이버 뉴스 검색 API와 Gemini API를 활용한 언론사 그룹별 뉴스 프레임 비교 MVP입니다.")
 
+
+# =============================
+# 비교 그룹 설정
+# =============================
+
 TARGET_MEDIA = {
     "progressive": ["한겨레", "경향신문", "오마이뉴스"],
     "conservative": ["조선일보", "중앙일보", "동아일보"],
     "center": ["연합뉴스", "한국일보", "서울신문", "뉴스1", "뉴시스"]
 }
+
+
+# =============================
+# 주제별 관련 키워드 설정
+# =============================
+
 TOPIC_KEYWORDS = {
-    "저출산": ["저출산", "저출생", "출산율", "출생률", "인구", "육아", "양육", "보육", "돌봄", "난임", "출산"],
-    "저출생": ["저출산", "저출생", "출산율", "출생률", "인구", "육아", "양육", "보육", "돌봄", "난임", "출산"],
-    "국민연금": ["국민연금", "연금", "보험료율", "소득대체율", "노후소득", "기금", "개혁"],
-    "연금": ["국민연금", "연금", "보험료율", "소득대체율", "노후소득", "기금", "개혁"],
-    "의료개혁": ["의료개혁", "의대", "의사", "전공의", "병원", "건강보험", "필수의료", "의료"],
-    "돌봄": ["돌봄", "요양", "간병", "보육", "육아", "장기요양", "사회서비스", "복지"],
-    "복지": ["복지", "사회보장", "급여", "수급", "취약계층", "사회서비스", "지원"],
-    "사회보장": ["사회보장", "복지", "급여", "수급", "취약계층", "사회서비스", "지원"],
-    "부동산": ["부동산", "집값", "주택", "전세", "월세", "청약", "공급", "재건축"],
-    "노동": ["노동", "근로", "임금", "노조", "고용", "일자리", "근로시간"]
+    "저출산": [
+        "저출산", "저출생", "출산율", "출생률", "합계출산율",
+        "인구", "인구절벽", "인구소멸", "육아", "양육", "보육",
+        "돌봄", "난임", "출산", "출생", "아이", "아동", "청년"
+    ],
+    "저출생": [
+        "저출산", "저출생", "출산율", "출생률", "합계출산율",
+        "인구", "인구절벽", "인구소멸", "육아", "양육", "보육",
+        "돌봄", "난임", "출산", "출생", "아이", "아동", "청년"
+    ],
+    "출산율": [
+        "저출산", "저출생", "출산율", "출생률", "합계출산율",
+        "인구", "육아", "양육", "보육", "돌봄", "출산", "출생"
+    ],
+    "국민연금": [
+        "국민연금", "연금", "보험료율", "소득대체율",
+        "노후소득", "기금", "연금개혁", "재정안정", "노후"
+    ],
+    "연금": [
+        "국민연금", "연금", "보험료율", "소득대체율",
+        "노후소득", "기금", "연금개혁", "재정안정", "노후"
+    ],
+    "의료개혁": [
+        "의료개혁", "의대", "의사", "전공의", "병원",
+        "건강보험", "필수의료", "의료", "응급실", "수가"
+    ],
+    "의료": [
+        "의료개혁", "의대", "의사", "전공의", "병원",
+        "건강보험", "필수의료", "의료", "응급실", "수가"
+    ],
+    "돌봄": [
+        "돌봄", "요양", "간병", "보육", "육아",
+        "장기요양", "사회서비스", "복지", "가족돌봄", "돌봄공백"
+    ],
+    "복지": [
+        "복지", "사회보장", "급여", "수급", "취약계층",
+        "사회서비스", "지원", "보장", "복지정책"
+    ],
+    "사회보장": [
+        "사회보장", "복지", "급여", "수급", "취약계층",
+        "사회서비스", "지원", "보장", "보장제도"
+    ],
+    "부동산": [
+        "부동산", "집값", "주택", "전세", "월세",
+        "청약", "공급", "재건축", "재개발", "아파트"
+    ],
+    "노동": [
+        "노동", "근로", "임금", "노조", "고용",
+        "일자리", "근로시간", "노동시간", "최저임금"
+    ]
+}
+
+GENERIC_WORDS = {
+    "정책", "대책", "문제", "이슈", "뉴스", "관련", "현안",
+    "논란", "분석", "전망", "정부", "국회", "사회", "경제",
+    "오늘", "주요", "최근"
 }
 
 
-def get_relevance_keywords(base_query):
-    keywords = []
-
-    # 사용자가 입력한 단어 자체도 키워드로 사용
-    for word in base_query.replace(",", " ").split():
-        word = word.strip()
-        if len(word) >= 2:
-            keywords.append(word)
-
-    # 미리 정의한 주제별 관련어 추가
-    for topic, topic_words in TOPIC_KEYWORDS.items():
-        if topic in base_query:
-            keywords.extend(topic_words)
-
-    # 중복 제거
-    return list(dict.fromkeys(keywords))
-
-
-def filter_relevant_news(df, base_query):
-    if df.empty:
-        return df
-
-    keywords = get_relevance_keywords(base_query)
-
-    if not keywords:
-        return df
-
-    def is_relevant(row):
-        text = f"{row.get('title', '')} {row.get('description', '')}"
-        return any(keyword in text for keyword in keywords)
-
-    filtered_df = df[df.apply(is_relevant, axis=1)].copy()
-
-    return filtered_df
+# =============================
+# 유틸 함수
+# =============================
 
 def clean_text(text):
     text = html.unescape(str(text))
@@ -76,11 +108,93 @@ def clean_text(text):
 
 
 def get_secret(name):
+    """
+    Streamlit Cloud에서는 st.secrets에서 읽고,
+    로컬 실행 시에는 환경변수에서 읽는다.
+    """
     try:
-        return st.secrets.get(name, "")
+        value = st.secrets[name]
+        if value:
+            return str(value)
     except Exception:
-        return ""
+        pass
 
+    return os.getenv(name, "")
+
+
+def get_relevance_keywords(base_query):
+    """
+    사용자가 입력한 검색어와 미리 정의한 주제별 키워드를 합쳐
+    관련성 필터링에 사용할 키워드 목록을 만든다.
+    """
+    keywords = []
+
+    # 사용자가 입력한 단어 중 너무 일반적인 단어는 제외
+    for word in base_query.replace(",", " ").split():
+        word = word.strip()
+        if len(word) >= 2 and word not in GENERIC_WORDS:
+            keywords.append(word)
+
+    # 주제별 관련 키워드 추가
+    for topic, topic_words in TOPIC_KEYWORDS.items():
+        if topic in base_query:
+            keywords.extend(topic_words)
+
+    # 중복 제거
+    keywords = list(dict.fromkeys(keywords))
+
+    return keywords
+
+
+def relevance_score(row, keywords):
+    """
+    제목과 요약문 안에 관련 키워드가 몇 개 들어 있는지 계산한다.
+    """
+    text = f"{row.get('title', '')} {row.get('description', '')}"
+
+    score = 0
+    for keyword in keywords:
+        if keyword in text:
+            score += 1
+
+    return score
+
+
+def filter_relevant_news(df, base_query):
+    """
+    검색 주제와 관련성이 낮은 기사를 제거한다.
+    단, 너무 엄격하게 걸러져서 아무 기사도 남지 않으면 원래 결과를 반환한다.
+    """
+    if df.empty:
+        return df
+
+    keywords = get_relevance_keywords(base_query)
+
+    if not keywords:
+        df["relevance_score"] = 0
+        return df
+
+    df = df.copy()
+    df["relevance_score"] = df.apply(lambda row: relevance_score(row, keywords), axis=1)
+
+    filtered_df = df[df["relevance_score"] > 0].copy()
+
+    # 관련 기사만 먼저 정렬
+    filtered_df = filtered_df.sort_values(
+        by=["group", "target_media", "relevance_score"],
+        ascending=[True, True, False]
+    )
+
+    # 전부 걸러지면 원래 결과 반환
+    if filtered_df.empty:
+        return df
+
+    return filtered_df
+
+
+# =============================
+# 네이버 뉴스 검색
+# =============================
 
 def search_naver_news(query, display=3, sort="date"):
     naver_client_id = get_secret("NAVER_CLIENT_ID")
@@ -136,11 +250,16 @@ def search_naver_news(query, display=3, sort="date"):
 
 
 def collect_news_by_media_group(base_query, display_per_media=3):
+    """
+    검색어 + 언론사명 조합으로 그룹별 뉴스를 수집한다.
+    예: 저출산 정책 한겨레, 저출산 정책 조선일보, 저출산 정책 연합뉴스
+    """
     all_rows = []
 
     for group, media_list in TARGET_MEDIA.items():
         for media in media_list:
             search_query = f"{base_query} {media}"
+
             temp_df = search_naver_news(
                 query=search_query,
                 display=display_per_media,
@@ -159,18 +278,18 @@ def collect_news_by_media_group(base_query, display_per_media=3):
     if not all_rows:
         return pd.DataFrame()
 
-result_df = pd.concat(all_rows, ignore_index=True)
-result_df = result_df.drop_duplicates(subset=["link"])
+    result_df = pd.concat(all_rows, ignore_index=True)
+    result_df = result_df.drop_duplicates(subset=["link"])
 
-# 검색 주제와 관련성이 낮은 기사 제거
-filtered_df = filter_relevant_news(result_df, base_query)
+    # 관련성 필터 적용
+    result_df = filter_relevant_news(result_df, base_query)
 
-# 너무 엄격하게 걸러져서 아무 기사도 남지 않으면 원래 결과를 보여줌
-if filtered_df.empty:
     return result_df
 
-return filtered_df    
 
+# =============================
+# Gemini 요약
+# =============================
 
 def summarize_with_gemini(df, base_query):
     gemini_api_key = get_secret("GEMINI_API_KEY")
@@ -224,6 +343,7 @@ Streamlit Secrets에서 `GEMINI_API_KEY` 값을 확인하세요.
 - progressive, conservative, center는 사용자가 설정한 비교 그룹명이다.
 - 정치적 판단이 아니라 보도 강조점, 표현, 프레임 차이를 비교한다.
 - 같은 이슈가 섞여 있으면 그 한계를 밝힌다.
+- 특정 그룹에 관련 기사가 부족하면 부족하다고 명시한다.
 
 출력 형식:
 
@@ -299,6 +419,10 @@ Gemini가 빈 응답을 반환했습니다.
 """
 
 
+# =============================
+# 화면 구성
+# =============================
+
 with st.sidebar:
     st.header("검색 설정")
 
@@ -327,6 +451,8 @@ if run_button:
     if not base_query.strip():
         st.warning("분석할 주제를 입력해주세요.")
     else:
+        keywords = get_relevance_keywords(base_query)
+
         with st.spinner("언론사 그룹별 뉴스를 수집하는 중입니다."):
             df = collect_news_by_media_group(
                 base_query=base_query,
@@ -338,17 +464,23 @@ if run_button:
         else:
             st.subheader("수집된 뉴스 목록")
 
+            if keywords:
+                st.caption("관련성 필터 키워드: " + ", ".join(keywords))
+
+            display_columns = [
+                "group",
+                "target_media",
+                "title",
+                "description",
+                "pubDate",
+                "link"
+            ]
+
+            if "relevance_score" in df.columns:
+                display_columns.insert(2, "relevance_score")
+
             st.dataframe(
-                df[
-                    [
-                        "group",
-                        "target_media",
-                        "title",
-                        "description",
-                        "pubDate",
-                        "link"
-                    ]
-                ],
+                df[display_columns],
                 use_container_width=True
             )
 

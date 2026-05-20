@@ -188,10 +188,32 @@ if run_button:
             use_container_width=True
         )
 
-        st.subheader("AI 프레임 비교 브리핑")
+st.subheader("AI 프레임 비교 브리핑")
 
-        with st.spinner("Gemini가 프레임 차이를 분석하는 중입니다."):
-            summary = summarize_with_gemini(df, base_query)
-            st.markdown(summary)
+with st.spinner("Gemini가 프레임 차이를 분석하는 중입니다."):
+    try:
+        summary = summarize_with_gemini(df, base_query)
+        st.markdown(summary)
+
+    except Exception as e:
+        st.warning("뉴스 수집은 완료되었지만, AI 프레임 비교 생성 중 오류가 발생했습니다.")
+
+        st.markdown("""
+### 가능한 원인
+- Gemini API 서버의 일시적 오류
+- 특정 검색어에서 생성된 뉴스 목록이 너무 길거나 불안정함
+- Gemini API 사용량 제한 또는 일시적 응답 실패
+- 검색 결과가 서로 다른 이슈로 많이 섞여 요약 요청이 불안정해짐
+
+### 바로 해볼 조치
+1. 검색어를 더 구체적으로 바꿔보세요.  
+   예: `저출산` → `저출산 대책`, `저출생 정책`, `출산율 정책`
+
+2. 언론사별 가져올 뉴스 수를 1로 줄여보세요.
+
+3. 잠시 후 다시 실행해보세요.
+""")
+
+        st.caption(f"오류 유형: {type(e).__name__}")
 else:
     st.info("왼쪽에서 분석할 주제를 입력하고 버튼을 눌러주세요.")

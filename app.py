@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import html
 import re
+import time
 from google import genai
 
 st.set_page_config(
@@ -20,14 +21,27 @@ TARGET_MEDIA = {
     "center": ["연합뉴스", "한국일보", "서울신문", "뉴스1", "뉴시스"]
 }
 
+
 def clean_text(text):
     text = html.unescape(str(text))
     text = re.sub(r"<.*?>", "", text)
     return text.strip()
 
+
+def get_secret(name):
+    try:
+        return st.secrets.get(name, "")
+    except Exception:
+        return ""
+
+
 def search_naver_news(query, display=3, sort="date"):
-    naver_client_id = st.secrets["NAVER_CLIENT_ID"]
-    naver_client_secret = st.secrets["NAVER_CLIENT_SECRET"]
+    naver_client_id = get_secret("NAVER_CLIENT_ID")
+    naver_client_secret = get_secret("NAVER_CLIENT_SECRET")
+
+    if not naver_client_id or not naver_client_secret:
+        st.error("네이버 API 키가 설정되지 않았습니다. Streamlit Secrets를 확인하세요.")
+        return pd.DataFrame()
 
     url = "https://openapi.naver.com/v1/search/news.json"
 
@@ -43,7 +57,16 @@ def search_naver_news(query, display=3, sort="date"):
         "sort": sort
     }
 
-    response = requests.get(url, headers=headers, params=params)
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=15
+        )
+    except Exception as e:
+        st.error(f"네이버 API 요청 중 오류가 발생했습니다: {type(e).__name__}")
+        return pd.DataFrame()
 
     if response.status_code != 200:
         st.error(f"네이버 API 오류: {response.status_code}")
@@ -64,13 +87,18 @@ def search_naver_news(query, display=3, sort="date"):
 
     return pd.DataFrame(rows)
 
+
 def collect_news_by_media_group(base_query, display_per_media=3):
     all_rows = []
 
     for group, media_list in TARGET_MEDIA.items():
         for media in media_list:
             search_query = f"{base_query} {media}"
-            temp_df = search_naver_news(search_query, display=display_per_media)
+            temp_df = search_naver_news(
+                query=search_query,
+                display=display_per_media,
+                sort="date"
+            )
 
             if temp_df.empty:
                 continue
@@ -89,14 +117,25 @@ def collect_news_by_media_group(base_query, display_per_media=3):
 
     return result_df
 
+
 def summarize_with_gemini(df, base_query):
-    gemini_api_key = st.secrets["GEMINI_API_KEY"]
+    gemini_api_key = get_secret("GEMINI_API_KEY")
+
+    if not gemini_api_key:
+        return """
+## AI 프레임 비교 생성 실패
+
+Gemini API 키가 설정되지 않았습니다.  
+Streamlit Secrets에서 `GEMINI_API_KEY` 값을 확인하세요.
+"""
+
     client = genai.Client(api_key=gemini_api_key)
 
+    max_articles_per_group = 3
     grouped_news_text = ""
 
     for group in ["progressive", "conservative", "center"]:
-        group_df = df[df["group"] == group]
+        group_df = df[df["group"] == group].head(max_articles_per_group)
         grouped_news_text += f"\n\n### {group} 그룹\n"
 
         if group_df.empty:
@@ -104,11 +143,16 @@ def summarize_with_gemini(df, base_query):
             continue
 
         for _, row in group_df.iterrows():
+            title = str(row.get("title", ""))[:120]
+            description = str(row.get("description", ""))[:220]
+            link = str(row.get("link", ""))
+            target_media = str(row.get("target_media", ""))
+
             grouped_news_text += f"""
-- 언론사 검색 기준: {row["target_media"]}
-- 제목: {row["title"]}
-- 요약: {row["description"]}
-- 링크: {row["link"]}
+- 언론사 검색 기준: {target_media}
+- 제목: {title}
+- 요약: {description}
+- 링크: {link}
 """
 
     prompt = f"""
@@ -116,15 +160,16 @@ def summarize_with_gemini(df, base_query):
 
 검색 주제: {base_query}
 
-아래 뉴스 목록은 사용자가 설정한 언론사 그룹별로 수집된 뉴스 검색 결과다.
+아래 뉴스 목록은 사용자가 설정한 언론사 그룹별 뉴스 검색 결과다.
 기사 본문 전문이 아니라 제목과 요약문만 제공되었다.
 
-원칙:
-- 제목과 요약문에 근거해서만 분석하라.
-- 기사에 없는 사실을 만들어내지 말라.
-- 단정적인 표현을 피하라.
+분석 원칙:
+- 제목과 요약문에 근거해서만 분석한다.
+- 기사에 없는 사실은 만들지 않는다.
+- 단정적 표현을 피한다.
 - progressive, conservative, center는 사용자가 설정한 비교 그룹명이다.
-- 정치적 판단이 아니라 보도 프레임, 강조점, 표현 차이를 비교하라.
+- 정치적 판단이 아니라 보도 강조점, 표현, 프레임 차이를 비교한다.
+- 같은 이슈가 섞여 있으면 그 한계를 밝힌다.
 
 출력 형식:
 
@@ -148,17 +193,65 @@ def summarize_with_gemini(df, base_query):
 {grouped_news_text}
 """
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt
-    )
+    last_error = None
 
-    return response.text
+    for attempt in range(2):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt
+            )
+
+            if response.text:
+                return response.text
+
+            return """
+## AI 프레임 비교 생성 실패
+
+Gemini가 빈 응답을 반환했습니다.  
+검색어를 조금 더 구체적으로 바꿔 다시 시도하세요.
+"""
+
+        except Exception as e:
+            last_error = e
+            time.sleep(2)
+
+    return f"""
+## AI 프레임 비교 생성 실패
+
+뉴스 수집은 정상적으로 완료되었지만, Gemini 요약 생성 단계에서 오류가 발생했습니다.
+
+### 현재 상태
+- 네이버 뉴스 수집: 정상
+- 뉴스 목록 표시: 정상
+- Gemini 요약 생성: 실패
+
+### 가능한 원인
+- Gemini API 서버의 일시적 오류
+- 특정 검색어에서 생성된 뉴스 목록이 너무 길거나 불안정함
+- Gemini API 사용량 제한 또는 일시적 응답 실패
+- 검색 결과가 서로 다른 이슈로 많이 섞여 요약 요청이 불안정해짐
+
+### 바로 해볼 조치
+1. 검색어를 더 구체적으로 바꿔보세요.  
+   예: `저출산` → `저출산 대책`, `저출생 정책`, `출산율 정책`
+
+2. 언론사별 가져올 뉴스 수를 1로 줄여보세요.
+
+3. 잠시 후 다시 실행해보세요.
+
+### 오류 유형
+`{type(last_error).__name__}`
+"""
+
 
 with st.sidebar:
     st.header("검색 설정")
 
-    base_query = st.text_input("분석할 주제", value="돌봄")
+    base_query = st.text_input(
+        "분석할 주제",
+        value="돌봄"
+    )
 
     display_per_media = st.slider(
         "언론사별 가져올 뉴스 수",
@@ -175,45 +268,41 @@ with st.sidebar:
     st.write("conservative:", ", ".join(TARGET_MEDIA["conservative"]))
     st.write("center:", ", ".join(TARGET_MEDIA["center"]))
 
+
 if run_button:
-    with st.spinner("뉴스를 수집하는 중입니다."):
-        df = collect_news_by_media_group(base_query, display_per_media)
-
-    if df.empty:
-        st.error("수집된 뉴스가 없습니다. 검색어를 바꿔보세요.")
+    if not base_query.strip():
+        st.warning("분석할 주제를 입력해주세요.")
     else:
-        st.subheader("수집 결과")
-        st.dataframe(
-            df[["group", "target_media", "title", "description", "pubDate", "link"]],
-            use_container_width=True
-        )
+        with st.spinner("언론사 그룹별 뉴스를 수집하는 중입니다."):
+            df = collect_news_by_media_group(
+                base_query=base_query,
+                display_per_media=display_per_media
+            )
 
-st.subheader("AI 프레임 비교 브리핑")
+        if df.empty:
+            st.error("수집된 뉴스가 없습니다. 검색어를 바꿔보세요.")
+        else:
+            st.subheader("수집된 뉴스 목록")
 
-with st.spinner("Gemini가 프레임 차이를 분석하는 중입니다."):
-    try:
-        summary = summarize_with_gemini(df, base_query)
-        st.markdown(summary)
+            st.dataframe(
+                df[
+                    [
+                        "group",
+                        "target_media",
+                        "title",
+                        "description",
+                        "pubDate",
+                        "link"
+                    ]
+                ],
+                use_container_width=True
+            )
 
-    except Exception as e:
-        st.warning("뉴스 수집은 완료되었지만, AI 프레임 비교 생성 중 오류가 발생했습니다.")
+            st.subheader("AI 프레임 비교 브리핑")
 
-        st.markdown("""
-### 가능한 원인
-- Gemini API 서버의 일시적 오류
-- 특정 검색어에서 생성된 뉴스 목록이 너무 길거나 불안정함
-- Gemini API 사용량 제한 또는 일시적 응답 실패
-- 검색 결과가 서로 다른 이슈로 많이 섞여 요약 요청이 불안정해짐
+            with st.spinner("Gemini가 프레임 차이를 분석하는 중입니다."):
+                summary = summarize_with_gemini(df, base_query)
+                st.markdown(summary)
 
-### 바로 해볼 조치
-1. 검색어를 더 구체적으로 바꿔보세요.  
-   예: `저출산` → `저출산 대책`, `저출생 정책`, `출산율 정책`
-
-2. 언론사별 가져올 뉴스 수를 1로 줄여보세요.
-
-3. 잠시 후 다시 실행해보세요.
-""")
-
-        st.caption(f"오류 유형: {type(e).__name__}")
 else:
     st.info("왼쪽에서 분석할 주제를 입력하고 버튼을 눌러주세요.")

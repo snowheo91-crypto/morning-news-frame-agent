@@ -20,7 +20,54 @@ TARGET_MEDIA = {
     "conservative": ["조선일보", "중앙일보", "동아일보"],
     "center": ["연합뉴스", "한국일보", "서울신문", "뉴스1", "뉴시스"]
 }
+TOPIC_KEYWORDS = {
+    "저출산": ["저출산", "저출생", "출산율", "출생률", "인구", "육아", "양육", "보육", "돌봄", "난임", "출산"],
+    "저출생": ["저출산", "저출생", "출산율", "출생률", "인구", "육아", "양육", "보육", "돌봄", "난임", "출산"],
+    "국민연금": ["국민연금", "연금", "보험료율", "소득대체율", "노후소득", "기금", "개혁"],
+    "연금": ["국민연금", "연금", "보험료율", "소득대체율", "노후소득", "기금", "개혁"],
+    "의료개혁": ["의료개혁", "의대", "의사", "전공의", "병원", "건강보험", "필수의료", "의료"],
+    "돌봄": ["돌봄", "요양", "간병", "보육", "육아", "장기요양", "사회서비스", "복지"],
+    "복지": ["복지", "사회보장", "급여", "수급", "취약계층", "사회서비스", "지원"],
+    "사회보장": ["사회보장", "복지", "급여", "수급", "취약계층", "사회서비스", "지원"],
+    "부동산": ["부동산", "집값", "주택", "전세", "월세", "청약", "공급", "재건축"],
+    "노동": ["노동", "근로", "임금", "노조", "고용", "일자리", "근로시간"]
+}
 
+
+def get_relevance_keywords(base_query):
+    keywords = []
+
+    # 사용자가 입력한 단어 자체도 키워드로 사용
+    for word in base_query.replace(",", " ").split():
+        word = word.strip()
+        if len(word) >= 2:
+            keywords.append(word)
+
+    # 미리 정의한 주제별 관련어 추가
+    for topic, topic_words in TOPIC_KEYWORDS.items():
+        if topic in base_query:
+            keywords.extend(topic_words)
+
+    # 중복 제거
+    return list(dict.fromkeys(keywords))
+
+
+def filter_relevant_news(df, base_query):
+    if df.empty:
+        return df
+
+    keywords = get_relevance_keywords(base_query)
+
+    if not keywords:
+        return df
+
+    def is_relevant(row):
+        text = f"{row.get('title', '')} {row.get('description', '')}"
+        return any(keyword in text for keyword in keywords)
+
+    filtered_df = df[df.apply(is_relevant, axis=1)].copy()
+
+    return filtered_df
 
 def clean_text(text):
     text = html.unescape(str(text))
@@ -112,10 +159,17 @@ def collect_news_by_media_group(base_query, display_per_media=3):
     if not all_rows:
         return pd.DataFrame()
 
-    result_df = pd.concat(all_rows, ignore_index=True)
-    result_df = result_df.drop_duplicates(subset=["link"])
+result_df = pd.concat(all_rows, ignore_index=True)
+result_df = result_df.drop_duplicates(subset=["link"])
 
+# 검색 주제와 관련성이 낮은 기사 제거
+filtered_df = filter_relevant_news(result_df, base_query)
+
+# 너무 엄격하게 걸러져서 아무 기사도 남지 않으면 원래 결과를 보여줌
+if filtered_df.empty:
     return result_df
+
+return filtered_df    
 
 
 def summarize_with_gemini(df, base_query):
